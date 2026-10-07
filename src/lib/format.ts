@@ -4,28 +4,38 @@ import type { AdminRequest } from "./famcare";
 import { istDate } from "./famcare";
 import { esc, type InlineButton } from "./telegram";
 
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
 const timeFmt = new Intl.DateTimeFormat("en-IN", {
   timeZone: IST,
-  hour: "2-digit",
+  hour: "numeric",
   minute: "2-digit",
   hour12: true,
 });
 
-const dateTimeFmt = new Intl.DateTimeFormat("en-IN", {
+const dayFmt = new Intl.DateTimeFormat("en-IN", {
   timeZone: IST,
   day: "2-digit",
   month: "short",
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: true,
 });
 
+const dayWithWeekdayFmt = new Intl.DateTimeFormat("en-IN", {
+  timeZone: IST,
+  weekday: "short",
+  day: "2-digit",
+  month: "short",
+});
+
+/** "6:00 PM" — en-IN renders am/pm lowercase, which looks like a typo next to
+ *  bold text, so normalise it. */
 function time(ts: string | null): string {
-  return ts ? timeFmt.format(new Date(ts)) : "—";
+  return ts ? timeFmt.format(new Date(ts)).replace(/\s*([ap])\.?m\.?/i, (_, p) => ` ${p.toUpperCase()}M`) : "—";
 }
 
-function dateTime(ts: string | null): string {
-  return ts ? dateTimeFmt.format(new Date(ts)) : "—";
+function day(ts: string | null): string {
+  return ts ? dayFmt.format(new Date(ts)) : "—";
 }
 
 /** amount_inr is paise. Mirrors the admin panel's own conversion. */
@@ -36,6 +46,26 @@ function rupees(paise: number | null): string {
     minimumFractionDigits: r % 1 === 0 ? 0 : 2,
     maximumFractionDigits: 2,
   })}`;
+}
+
+/** "2h 14m" / "45m" / "2d 3h" — compact, no leading verb so callers can frame
+ *  it as "in …", "… ago" or "… ahead". */
+function duration(mins: number): string {
+  const m = Math.round(Math.abs(mins));
+  if (m < 1) return "under a minute";
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  if (h < 24) return rem ? `${h}h ${rem}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  const hRem = h % 24;
+  return hRem ? `${d}d ${hRem}h` : `${d}d`;
+}
+
+function ordinal(n: number): string {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  return `${n}${["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
 }
 
 export function adminUrl(requestId: string): string {
@@ -49,7 +79,11 @@ export function ctaButton(requestId: string): InlineButton[] {
   return [{ text: "🔗 Open in Admin Panel", url: adminUrl(requestId) }];
 }
 
-/** Minutes between confirmation and service start. */
+// ---------------------------------------------------------------------------
+// Derived facts
+// ---------------------------------------------------------------------------
+
+/** Minutes between confirmation and service start — how far ahead it was booked. */
 function leadMinutes(r: AdminRequest): number | null {
   if (!r.scheduled_at || !r.created_at) return null;
   return (
@@ -71,113 +105,155 @@ function isEffectivelyInstant(r: AdminRequest): boolean {
   return lead === null || lead < 120;
 }
 
-function humanLead(mins: number): string {
-  if (mins < 0) return "now";
-  if (mins < 60) return `in ${Math.round(mins)} min`;
-  const h = Math.floor(mins / 60);
-  const m = Math.round(mins % 60);
-  return m ? `in ${h}h ${m}m` : `in ${h}h`;
+/** "Today" / "Tomorrow" / "Thu, 09 Oct" — a bare date reads as noise when it is
+ *  almost always today, but must not silently hide the case where it is not. */
+function dayLabel(ts: string | null): string {
+  if (!ts) return "—";
+  const d = istDate(new Date(ts));
+  const today = istDate();
+  if (d === today) return "Today";
+  const tomorrow = istDate(new Date(Date.now() + 86_400_000));
+  if (d === tomorrow) return "Tomorrow";
+  return dayWithWeekdayFmt.format(new Date(ts));
 }
 
-function serviceLine(r: AdminRequest): string {
-  const ss = r.sub_service;
-  if (!ss) return "Unknown service";
-  const parts = [ss.service_name, ss.name].filter(Boolean).join(" › ");
-  const tier =
-    ss.tier_label ?? (ss.tier_hours != null ? `${ss.tier_hours}h` : null);
-  return tier ? `${parts} · ${tier}` : parts;
-}
-
-function customerLine(r: AdminRequest): string {
-  const name = r.customer?.name?.trim();
-  const nth = r.nth_booking;
-  const kind =
-    nth == null ? null : nth === 1 ? "first booking" : `booking #${nth}`;
-  if (name && kind) return `${esc(name)} (${kind})`;
-  if (name) return esc(name);
-  return kind ?? "—";
-}
-
-function zoneLine(r: AdminRequest): string | null {
-  if (!r.service_zone) return null;
-  const km =
-    r.service_zone_distance_km != null
-      ? ` · ${r.service_zone_distance_km} km from hub`
-      : "";
-  const label =
-    r.service_zone === "outside"
-      ? "⚠️ outside service radius"
-      : `${r.service_zone} circle`;
-  return `${label}${km}`;
-}
+// ---------------------------------------------------------------------------
+// The booking ping
+// ---------------------------------------------------------------------------
 
 /** The message for one booking.
- *  Deliberately carries no customer phone number. */
+ *
+ *  Laid out as four blocks so the eye lands on the actionable parts first:
+ *
+ *    1. what was booked          (service, tier, instant flag)
+ *    2. when and where           (slot, countdown, hub, zone)
+ *    3. who                      (customer, caregiver, price, status)
+ *    4. provenance               (booked-at, lead, ids)
+ *
+ *  Everything the flat version carried is still here — nothing was dropped,
+ *  only regrouped and given weight. Deliberately no customer phone number.
+ *
+ *  Telegram HTML only: <b>, <i>, <code>, <a>. No tables or <pre>, which wrap
+ *  badly on narrow phone screens. */
 export function bookingMessage(
   r: AdminRequest,
   opts: { heading?: string } = {},
 ): string {
-  const shortId = r.id.slice(0, 8);
-  const isToday = istDate(new Date(r.scheduled_at ?? r.created_at ?? "")) ===
-    istDate();
-
   const instant = isEffectivelyInstant(r);
-  const heading =
-    opts.heading ??
-    (instant ? "⚡ <b>New INSTANT booking</b>" : "🆕 <b>New booking</b>");
+  const ss = r.sub_service;
+
+  // --- 1. what -------------------------------------------------------------
+  const kind = opts.heading ?? (instant ? "⚡ <b>Instant booking</b>" : "🆕 <b>New booking</b>");
+  const serviceTop = ss?.service_name ? ` · ${esc(ss.service_name)}` : "";
+  const tier = ss?.tier_label ?? (ss?.tier_hours != null ? `${ss.tier_hours}h` : null);
 
   const lines: string[] = [
-    heading,
+    `${kind}${serviceTop}`,
+    `<b>${esc(ss?.name ?? "Unknown service")}</b>${tier ? ` · ${esc(tier)}` : ""}`,
     "",
-    `<b>${esc(serviceLine(r))}</b>`,
-    "",
-    `🆔 <code>${esc(r.id)}</code>`,
-    `📌 Status: <b>${esc(r.status)}</b>${instant ? " · instant" : ""}`,
-    `🕐 Booked at: ${esc(dateTime(r.created_at))}`,
-    `📅 Scheduled: <b>${esc(dateTime(r.scheduled_at))}</b>${
-      isToday ? " (today)" : ""
-    }`,
   ];
 
-  const lead = leadMinutes(r);
-  if (lead !== null) {
-    lines.push(`⏱ Starts ${esc(humanLead(lead))} from booking`);
+  // --- 2. when & where -----------------------------------------------------
+  const start = r.scheduled_at ?? r.created_at;
+  const window = r.end_time
+    ? `${time(start)} → ${time(r.end_time)}`
+    : time(start);
+  lines.push(`🗓 <b>${esc(dayLabel(start))}, ${esc(window)}</b>`);
+
+  // Countdown from NOW, which is what someone reading the alert acts on.
+  if (start) {
+    const mins = (new Date(start).getTime() - Date.now()) / 60_000;
+    lines.push(
+      mins >= 0
+        ? `⏱ starts in ${esc(duration(mins))}`
+        : `⏱ <b>started ${esc(duration(mins))} ago</b>`,
+    );
   }
-  if (r.end_time) lines.push(`⏳ Ends: ${esc(time(r.end_time))}`);
+
+  const place: string[] = [];
+  if (r.hub_name) place.push(esc(r.hub_name));
+  if (r.service_zone) {
+    const km =
+      r.service_zone_distance_km != null
+        ? `, ${r.service_zone_distance_km} km`
+        : "";
+    place.push(
+      r.service_zone === "outside"
+        ? `<b>⚠️ outside service radius</b>${esc(km)}`
+        : `${esc(r.service_zone)} circle${esc(km)}`,
+    );
+  }
+  if (place.length) lines.push(`📍 ${place.join(" · ")}`);
+
+  // --- 3. who & how much ---------------------------------------------------
+  lines.push("");
+
+  const customer = [
+    r.customer?.name?.trim() ? esc(r.customer.name.trim()) : null,
+    r.nth_booking != null
+      ? r.nth_booking === 1
+        ? "<b>first booking</b>"
+        : `${ordinal(r.nth_booking)} booking`
+      : null,
+  ].filter(Boolean);
+  lines.push(`👤 ${customer.length ? customer.join(" · ") : "—"}`);
 
   lines.push(
-    `🏢 Hub: ${esc(r.hub_name ?? "—")}`,
-    `💰 Amount: <b>${esc(rupees(r.amount_inr))}</b>`,
-    `👤 Customer: ${customerLine(r)}`,
-    `🧑‍⚕️ Caregiver: ${
-      r.rider?.name ? esc(r.rider.name) : "<i>unassigned</i>"
-    }`,
+    r.rider?.name
+      ? `🧑‍⚕️ ${esc(r.rider.name)}`
+      : "🧑‍⚕️ <b>⚠️ unassigned</b>",
   );
 
-  const zone = zoneLine(r);
-  if (zone) lines.push(`📍 ${esc(zone)}`);
+  lines.push(`💰 <b>${esc(rupees(r.amount_inr))}</b> · ${esc(r.status)}`);
 
-  lines.push("", `#${esc(shortId)}`);
+  // --- 4. provenance -------------------------------------------------------
+  const lead = leadMinutes(r);
+  const booked = [
+    `Booked ${day(r.created_at)}, ${time(r.created_at)}`,
+    lead !== null ? `${duration(lead)} ahead` : null,
+    `#${r.id.slice(0, 8)}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  lines.push("", `<i>${esc(booked)}</i>`, `<code>${esc(r.id)}</code>`);
+
   return lines.join("\n");
 }
 
-/** Compact one-line-per-booking roster, for /today. Telegram caps a message at
- *  4096 chars, so long days are chunked by the caller. */
+// ---------------------------------------------------------------------------
+// The /today roster
+// ---------------------------------------------------------------------------
+
+/** Two lines per booking: the slot and service, then the operational detail.
+ *  Compact enough to scan a whole day, detailed enough to act without opening
+ *  each one. */
 export function rosterLine(r: AdminRequest): string {
   const ss = r.sub_service;
-  const label = [ss?.service_name, ss?.name].filter(Boolean).join(" › ");
   const tier =
-    ss?.tier_label ?? (ss?.tier_hours != null ? `${ss.tier_hours}h` : "");
+    ss?.tier_label ?? (ss?.tier_hours != null ? `${ss.tier_hours}h` : null);
+  const start = r.scheduled_at ?? r.created_at;
+  const window = r.end_time
+    ? `${time(start)} → ${time(r.end_time)}`
+    : time(start);
+
+  // Unassigned is the one thing worth scanning for, so the warning sits on the
+  // caregiver token itself rather than at the head of the line.
+  const detail = [
+    rupees(r.amount_inr),
+    r.hub_name ?? null,
+    r.status,
+    isEffectivelyInstant(r) ? "instant" : null,
+    r.rider?.name ? esc(r.rider.name) : "<b>⚠️ unassigned</b>",
+  ].filter(Boolean) as string[];
+
   return [
-    `<b>${esc(time(r.scheduled_at ?? r.created_at))}</b> · ${esc(label)}${
-      tier ? ` (${esc(tier)})` : ""
+    `<b>${esc(window)}</b> · ${esc(ss?.name ?? "Unknown service")}${
+      tier ? ` · ${esc(tier)}` : ""
     }`,
-    `   ${esc(r.status)}${isEffectivelyInstant(r) ? " · instant" : ""} · ${esc(
-      r.hub_name ?? "—",
-    )} · ${esc(rupees(r.amount_inr))} · ${
-      r.rider?.name ? esc(r.rider.name) : "unassigned"
-    }`,
-    `   <a href="${adminUrl(r.id)}">open ${esc(r.id.slice(0, 8))}</a>`,
+    `↳ ${detail
+      .map((d) => (d.startsWith("<") ? d : esc(d)))
+      .join(" · ")} · <a href="${adminUrl(r.id)}">open</a>`,
   ].join("\n");
 }
 
@@ -192,14 +268,9 @@ export function rosterMessages(
   bookings: AdminRequest[],
   board: AdminRequest[] = bookings,
 ): string[] {
-  const header = `📋 <b>Today's bookings — ${esc(
-    new Intl.DateTimeFormat("en-IN", {
-      timeZone: IST,
-      weekday: "short",
-      day: "2-digit",
-      month: "short",
-    }).format(new Date()),
-  )}</b>\n<i>new + scheduled, all hubs</i>`;
+  const header =
+    `📋 <b>Today's bookings</b> · ${esc(dayWithWeekdayFmt.format(new Date()))}\n` +
+    `<i>awaiting dispatch — new + scheduled, all hubs</i>`;
 
   const others = board.filter((r) => !["new", "scheduled"].includes(r.status));
   const otherCounts = others.reduce<Record<string, number>>((acc, r) => {
@@ -207,28 +278,26 @@ export function rosterMessages(
     return acc;
   }, {});
   const footer = others.length
-    ? `\n<i>Also on today's board: ${Object.entries(otherCounts)
-        .sort((a, b) => b[1] - a[1])
-        .map(([k, v]) => `${v} ${esc(k)}`)
-        .join(", ")}</i>`
+    ? `\n<i>Also on today's board: ${esc(
+        Object.entries(otherCounts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => `${v} ${k}`)
+          .join(", "),
+      )}</i>`
     : "";
 
   if (bookings.length === 0) {
     return [
-      `${header}\n\nNothing currently awaiting dispatch — no bookings in <code>new</code> or <code>scheduled</code>.${footer}`,
+      `${header}\n\nNothing awaiting dispatch right now.${footer}`,
     ];
   }
 
-  const counts = bookings.reduce<Record<string, number>>((acc, r) => {
-    acc[r.status] = (acc[r.status] ?? 0) + 1;
-    return acc;
-  }, {});
+  const unassigned = bookings.filter((r) => !r.rider?.name).length;
   const totalPaise = bookings.reduce((s, r) => s + (r.amount_inr ?? 0), 0);
-  const summary = `\n\n<b>${bookings.length}</b> bookings · ${Object.entries(
-    counts,
-  )
-    .map(([k, v]) => `${v} ${esc(k)}`)
-    .join(" · ")} · ${esc(rupees(totalPaise))}\n`;
+  const summary =
+    `\n\n<b>${bookings.length}</b> awaiting · <b>${esc(rupees(totalPaise))}</b>` +
+    (unassigned ? ` · <b>⚠️ ${unassigned} unassigned</b>` : "") +
+    "\n";
 
   // Chunk under Telegram's 4096-char limit with headroom for the header.
   const LIMIT = 3600;
