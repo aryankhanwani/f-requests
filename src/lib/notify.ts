@@ -74,6 +74,39 @@ export async function dryRun(): Promise<{
 }
 
 
+/** Send a real sample ping to one chat, bypassing the allowlist and the claim
+ *  ledger. Guarded by CRON_SECRET at the route.
+ *
+ *  Exists because the send path is otherwise only exercised once a booking
+ *  happens to arrive AND a chat is allowlisted. This proves the token, the HTML
+ *  rendering and the CTA button in one call, before deploying anything. */
+export async function sendTestPing(chatId: number): Promise<{
+  sentBooking: string | null;
+  ok: boolean;
+  error?: string;
+}> {
+  const board = await fetchTodayBoard();
+  // Prefer a real booking so formatting is tested against real data.
+  const sample = board.at(-1);
+
+  const [result] = sample
+    ? await broadcast(
+        [chatId],
+        bookingMessage(sample, {
+          heading: "\u{1F9EA} <b>Test ping</b> \u2014 real booking, formatting check",
+        }),
+        ctaButton(sample.id),
+      )
+    : await broadcast(
+        [chatId],
+        "\u{1F9EA} <b>Test ping</b>\n\nThe bot can reach this chat. Today's board " +
+          "is currently empty, so there was no real booking to render.",
+      );
+
+  return { sentBooking: sample?.id ?? null, ok: result.ok, error: result.error };
+}
+
+
 /** One pass: read today's board, claim whatever is unseen, ping what qualifies.
  *
  *  The claim happens before the send (see claimBookings), so overlapping

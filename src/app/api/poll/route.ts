@@ -1,11 +1,18 @@
 import { NextResponse } from "next/server";
 import { env } from "@/lib/env";
-import { dryRun, runPass, type PassResult } from "@/lib/notify";
+import { dryRun, runPass, sendTestPing, type PassResult } from "@/lib/notify";
 
 export const dynamic = "force-dynamic";
-// Vercel's cron floor is one minute, so a single invocation runs several passes
-// spaced a few seconds apart. That brings worst-case latency down to roughly
-// POLL_PASS_INTERVAL_MS instead of a full minute, with no extra infrastructure.
+// Two supported cadence models, both served by this one route:
+//
+//  - Scheduler can only fire once a minute (Vercel Pro cron): one invocation
+//    runs several passes spaced POLL_PASS_INTERVAL_MS apart, so latency is the
+//    interval rather than a full minute. This is what holds the function open.
+//  - Scheduler can fire every few seconds (Supabase pg_cron, needed on Vercel
+//    Hobby where cron only runs daily): call with ?passes=1 so each request
+//    returns in a second or two, well inside pg_net's response timeout.
+//
+// 60s is also the Hobby function ceiling, so it is the safe upper bound.
 export const maxDuration = 60;
 
 function authorized(req: Request): boolean {
@@ -25,9 +32,25 @@ async function handle(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
+  const params = new URL(req.url).searchParams;
+
   // Renders what would be sent, without claiming or sending anything.
-  if (new URL(req.url).searchParams.get("dry") === "1") {
+  if (params.get("dry") === "1") {
     return NextResponse.json(await dryRun());
+  }
+
+  // Sends one real sample ping to an explicit chat id, ignoring the allowlist
+  // and the ledger. For verifying the Telegram side end to end.
+  const test = params.get("test");
+  if (test) {
+    const chatId = Number(test);
+    if (!Number.isInteger(chatId)) {
+      return NextResponse.json(
+        { error: "test must be a numeric Telegram chat id" },
+        { status: 400 },
+      );
+    }
+    return NextResponse.json(await sendTestPing(chatId));
   }
 
   const started = Date.now();
@@ -37,7 +60,14 @@ async function handle(req: Request) {
   // Leave headroom so a slow final pass cannot blow the function timeout.
   const budgetMs = (maxDuration - 8) * 1000;
 
-  for (let i = 0; i < env.passesPerInvocation; i++) {
+  // ?passes=N lets the caller pick the cadence model without a redeploy.
+  const requested = Number(params.get("passes"));
+  const passCount =
+    Number.isFinite(requested) && requested >= 1
+      ? Math.min(Math.trunc(requested), 10)
+      : env.passesPerInvocation;
+
+  for (let i = 0; i < passCount; i++) {
     if (i > 0) {
       if (Date.now() - started + env.passIntervalMs > budgetMs) break;
       await sleep(env.passIntervalMs);

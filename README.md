@@ -47,6 +47,8 @@ Run `supabase/schema.sql` in the SQL editor. It creates three tables:
 | `notified_bookings` | claim ledger, so a booking is never announced twice |
 | `bot_state` | one row, marks that the initial silent seed has happened |
 
+`supabase/scheduler.sql` is separate and comes later — see step 4.
+
 ### 2. Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), keep the token.
@@ -68,7 +70,10 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
    you discover the id you need to add.
 
 For a group: add the bot to the group, send `/id` there, and allowlist the
-(negative) group id instead.
+(negative) group id instead. Note that a bot cannot be added to groups unless
+that is enabled — in BotFather, `/setjoingroups` → Enable. Group privacy mode
+also hides plain messages from bots, but **commands always reach it**, so
+`/today` works in a group without disabling privacy.
 
 ### 3. Vercel
 
@@ -76,15 +81,63 @@ Set every var from `.env.example` in project settings. `FAMCARE_ADMIN_*` must be
 a **superadmin** account — `GET /admin/requests` derives hub scope from the
 token, so a hub admin would only ever see their own hub's bookings.
 
-`vercel.json` already registers the cron. Vercel injects `CRON_SECRET` as
-`Authorization: Bearer $CRON_SECRET` on cron calls, so just set the env var.
+### 4. The scheduler — read this, it depends on your plan
 
-> Vercel cron needs the **Pro** plan for minute granularity. On Hobby, cron is
-> once a day — point an external scheduler (cron-job.org, Supabase `pg_cron` +
-> `pg_net`, GitHub Actions) at
-> `https://<deployment>/api/poll?secret=$CRON_SECRET` instead.
+**Vercel Hobby runs cron jobs once a day**, whatever expression is in
+`vercel.json`. A once-daily tick is useless for a booking alert, so on Hobby the
+schedule must come from somewhere else.
 
----
+`vercel.json` therefore ships a deliberately **daily** tick, which behaves the
+same on both plans and acts as a harmless safety net. Pick your real driver:
+
+#### Hobby — drive it from Supabase (recommended, no new accounts)
+
+Supabase already ships `pg_cron` and `pg_net`, so Postgres can call the route
+itself. Run `supabase/scheduler.sql`, filling in your deployment URL and
+`CRON_SECRET`. It stores both in Supabase Vault rather than inlining them into
+`cron.job`, schedules a tick every 15 seconds, and calls the route with
+`?passes=1` so each request returns in a second or two.
+
+Sub-minute scheduling needs `pg_cron >= 1.5`. Check it:
+
+```sql
+select extversion from pg_extension where extname = 'pg_cron';
+```
+
+If it is older, the file has a commented one-minute variant that uses
+`?passes=4` instead — the route then supplies the sub-minute cadence itself, for
+the same ~15s worst case.
+
+Verify ticks are landing — note that `cron.job_run_details` only proves the SQL
+ran, not that the HTTP call succeeded. The HTTP status is in pg_net:
+
+```sql
+select id, status_code, error_msg, created
+  from net._http_response order by created desc limit 20;
+```
+
+`200` is a real tick. `401` means the Vault secret and Vercel's `CRON_SECRET`
+disagree.
+
+#### Pro — use Vercel cron
+
+Change `vercel.json` to `"schedule": "* * * * *"` and you are done. One
+invocation then runs `POLL_PASSES_PER_INVOCATION` passes (default 4 × 15s) to
+beat the one-minute floor. Vercel injects `CRON_SECRET` as
+`Authorization: Bearer $CRON_SECRET` automatically.
+
+#### Any other scheduler
+
+The route accepts the secret as a query param too, so anything that can fetch a
+URL works — cron-job.org, Upstash QStash, a Cloudflare Worker cron, a box with
+crontab:
+
+```
+* * * * * curl -fsS "https://<deployment>/api/poll?secret=$CRON_SECRET&passes=4" >/dev/null
+```
+
+Avoid GitHub Actions for this. Its scheduled runs are queued, not guaranteed,
+and routinely drift ten minutes or more.
 
 ## Latency: why polling, not SSE
 
@@ -94,10 +147,15 @@ from `payments/service.py:1168`, instant ones from
 `process_assignment_for_request`). That is a true sub-second signal.
 
 A Vercel function cannot hold a long-lived stream open, so this build polls
-instead. To beat Vercel's one-minute cron floor, **one cron invocation runs
-several passes** spaced `POLL_PASS_INTERVAL_MS` apart
-(`POLL_PASSES_PER_INVOCATION` × that interval, default 4 × 15s). Worst-case
-latency is therefore ~15s rather than ~60s.
+instead, and `?passes=` lets one route serve either cadence model:
+
+| driver | call | why |
+|---|---|---|
+| pg_cron every 15s | `?passes=1` | frequency comes from the scheduler; each request is short |
+| cron every 60s | `?passes=4` | frequency comes from the route, which stays open ~45s |
+
+Either way worst-case latency is ~15s rather than ~60s. See
+[the scheduler section](#4-the-scheduler--read-this-it-depends-on-your-plan).
 
 If truly instant ever matters more than staying on Vercel, swap the poll route
 for an SSE consumer of `/admin/events` on any always-on Node host; everything
@@ -197,6 +255,22 @@ curl -s "http://localhost:3100/api/poll?secret=$CRON_SECRET&dry=1" | jq
 announce, plus the `/today` preview. It claims nothing and sends nothing, and
 tolerates an unconfigured Supabase.
 
+To prove the **Telegram** side end to end before deploying anything — token,
+HTML rendering, CTA button — press Start on the bot in Telegram, then:
+
+```bash
+# 1. find your chat id (works only while no webhook is registered)
+curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates" \
+  | jq '.result[].message.chat.id'
+
+# 2. send yourself a real booking, formatted exactly as a live ping
+curl -s "http://localhost:3100/api/poll?secret=$CRON_SECRET&test=<chat_id>"
+```
+
+`test=` ignores the allowlist and the ledger, so it neither marks a booking as
+announced nor requires you to be allowlisted yet. It is still behind
+`CRON_SECRET`.
+
 ```bash
 bun run typecheck
 bun run build
@@ -206,9 +280,22 @@ bun run build
 
 | route | auth | purpose |
 |---|---|---|
-| `GET\|POST /api/poll` | `Bearer $CRON_SECRET` or `?secret=` | the cron tick; `?dry=1` to preview |
+| `GET\|POST /api/poll` | `Bearer $CRON_SECRET` or `?secret=` | the cron tick. `?passes=N` sets passes per call, `?dry=1` previews without sending, `?test=<chat_id>` sends one real sample ping |
 | `POST /api/telegram` | `X-Telegram-Bot-Api-Secret-Token` | webhook. Without this header check the endpoint would be a public message sender |
 | `GET /api/health` | none | liveness |
+
+## Resetting the first-run seed
+
+The first tick absorbs today's board silently and writes `bot_state.seeded`, so
+it only ever happens once. To replay it — e.g. to see the "bot armed" greeting
+after allowlisting yourself — clear both:
+
+```sql
+delete from bot_state where key = 'seeded';
+delete from notified_bookings where service_date = (now() at time zone 'Asia/Kolkata')::date;
+```
+
+Harmless: the next tick re-absorbs the same bookings and greets you.
 
 ## Operational notes
 
